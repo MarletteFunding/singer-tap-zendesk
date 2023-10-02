@@ -637,6 +637,33 @@ class SLAPolicies(Stream):
         '''
         self.client.sla_policies()
 
+
+class CustomRoles(Stream):
+    name = "custom_roles"
+    replication_method = "INCREMENTAL"
+    replication_key = "updated_at"
+    endpoint = 'https://{}.zendesk.com/api/v2/custom_roles.json'
+    item_key = 'custom_roles'
+
+    def get_objects(self):
+        url = self.endpoint.format(self.config['subdomain'])
+        # Pass `request_timeout` parameter
+        pages = http.get_offset_based(url, self.config['access_token'], self.request_timeout)
+
+        for page in pages:
+            yield from page[self.item_key]
+
+    def sync(self, state):
+        bookmark = self.get_bookmark(state)
+        for custom_role in self.get_objects():
+            if utils.strptime_with_tz(custom_role['updated_at']) >= bookmark:
+                # NB: We don't trust that the records come back ordered by
+                # updated_at (we've observed out-of-order records),
+                # so we can't save state until we've seen all records
+                self.update_bookmark(state, custom_role['updated_at'])
+                yield (self.stream, custom_role)
+
+
 STREAMS = {
     "tickets": Tickets,
     "groups": Groups,
@@ -654,4 +681,6 @@ STREAMS = {
     "ticket_metric_events": TicketMetricEvents,
     "sla_policies": SLAPolicies,
     "talk_phone_numbers": TalkPhoneNumbers,
+    "custom_roles": CustomRoles,
 }
+
