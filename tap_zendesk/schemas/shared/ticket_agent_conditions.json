@@ -13,7 +13,13 @@
       ]
     },
     "child_fields": {
-      "$ref": "shared/ticket_child_fields.json"
+      "items": {
+        "$ref": "shared/ticket_child_fields.json"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
     },
     "value": {
       "type": [

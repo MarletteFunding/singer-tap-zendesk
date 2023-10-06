@@ -11,12 +11,12 @@
         "type": [
           "null",
           "string"
-        ],
-        "type": [
+        ]
+      },
+      "type": [
           "null",
           "array"
         ]
-      }
     },
     "type": [
       "null",
