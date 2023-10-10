@@ -1,11 +1,5 @@
 {
   "properties": {
-    "type": {
-      "type": [
-        "null",
-        "string"
-      ]
-    },
     "statuses": {
       "items": {
         "type": [
@@ -14,13 +8,14 @@
         ]
       },
       "type": [
-          "null",
-          "array"
-        ]
-    },
-    "type": [
-      "null",
-      "object"
-    ]
-  }
+        "null",
+        "array"
+      ]
+    }
+  },
+  "type": [
+    "null",
+    "object"
+  ]
+}
 }

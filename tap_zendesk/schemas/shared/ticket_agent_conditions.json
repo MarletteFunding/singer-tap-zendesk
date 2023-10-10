@@ -30,7 +30,7 @@
   },
   "type": [
     "null",
-    "object"
+    "array"
   ],
   "tap_schema_dependencies": [
     "ticket_child_fields"
