@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.6.4
+  * Bump dependency versions for twistlock compliance [#159](https://github.com/singer-io/tap-zendesk/pull/159)
+
+## 2.6.3
+  * Replace [#search](https://developer.zendesk.com/api-reference/ticketing/ticket-management/search/?_gl=1*1kjhwjj*_ga*NjA2MTA1ODg0LjE3NDQ3MTg3NDI.*_ga_0G6FC9CS2V*MTc0NDcxODg3OS4xLjEuMTc0NDcyMDM2Mi41Ni4wLjA.#export-search-results) endpoint for macros stream with [#list-macros](https://developer.zendesk.com/api-reference/ticketing/business-rules/macros/#list-macros) endpoint. [#158](https://github.com/singer-io/tap-zendesk/pull/158)
+
+## 2.6.2
+  * Upgrade aiohttp and requests lib versions to 3.11.9 and 2.32.3 respectively. [#157](https://github.com/singer-io/tap-zendesk/pull/157)
+
+## 2.6.1
+  * Retry for 5xx errors and resolve too many 429 errors [#155](https://github.com/singer-io/tap-zendesk/pull/155)
+
+## 2.6.0
+  * Performance improvement on ticket records sync [#153](https://github.com/singer-io/tap-zendesk/pull/153)
+
+## 2.4.0
+  * Upgrades to run on python 3.11.7 [#146](https://github.com/singer-io/tap-zendesk/pull/146)
+
+## 2.3.1
+  * Dependabot update [#129](https://github.com/singer-io/tap-zendesk/pull/129)
+## 2.3.0
+  * Adds configurable page size for requests [#141](https://github.com/singer-io/tap-zendesk/pull/141)
+## 2.2.0
+  * Adds Support for lookup fields [#124](https://github.com/singer-io/tap-zendesk/pull/124)
+
 ## 2.1.0
   * Adds new streams `talk_phone_numbers` and `ticket_metric_events` [#111](https://github.com/singer-io/tap-zendesk/pull/111)
 ## 2.0.1

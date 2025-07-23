@@ -1,8 +1,11 @@
 import os
 import json
 import datetime
+import asyncio
+import time
 import pytz
-import zenpy
+from zenpy.lib.exception import APIException
+from aiohttp import ClientSession
 import singer
 from singer import metadata
 from singer import utils
@@ -14,7 +17,11 @@ from tap_zendesk import http
 LOGGER = singer.get_logger()
 KEY_PROPERTIES = ['id']
 
+DEFAULT_PAGE_SIZE = 100
 REQUEST_TIMEOUT = 300
+CONCURRENCY_LIMIT = 20
+# Reference: https://developer.zendesk.com/api-reference/introduction/rate-limits/#endpoint-rate-limits:~:text=List%20Audits%20for,requests%20per%20minute
+AUDITS_REQUEST_PER_MINUTE = 450
 START_DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 HEADERS = {
     'Content-Type': 'application/json',
@@ -29,6 +36,7 @@ CUSTOM_TYPES = {
     'integer': 'integer',
     'decimal': 'number',
     'checkbox': 'boolean',
+    'lookup': 'integer',
 }
 
 def get_abs_path(path):
@@ -36,21 +44,15 @@ def get_abs_path(path):
 
 def process_custom_field(field):
     """ Take a custom field description and return a schema for it. """
-    zendesk_type = field.type
-    json_type = CUSTOM_TYPES.get(zendesk_type)
-    if json_type is None:
-        raise Exception("Discovered unsupported type for custom field {} (key: {}): {}"
-                        .format(field.title,
-                                field.key,
-                                zendesk_type))
-    field_schema = {'type': [
-        json_type,
-        'null'
-    ]}
+    if field.type not in CUSTOM_TYPES:
+        LOGGER.critical("Discovered unsupported type for custom field %s (key: %s): %s",
+                        field.title, field.key, field.type)
 
-    if zendesk_type == 'date':
+    json_type = CUSTOM_TYPES.get(field.type, "string")
+    field_schema = {'type': [json_type, 'null']}
+    if field.type == 'date':
         field_schema['format'] = 'datetime'
-    if zendesk_type == 'dropdown':
+    if field.type == 'dropdown':
         field_schema['enum'] = [o.value for o in field.custom_field_options]
 
     return field_schema
@@ -63,6 +65,7 @@ class Stream():
     stream = None
     endpoint = None
     request_timeout = None
+    page_size = None
 
     def __init__(self, client=None, config=None):
         self.client = client
@@ -78,6 +81,12 @@ class Stream():
         if config.get('search_window_size') and int(config.get('search_window_size')) < 2:
             raise ValueError('Search window size cannot be less than 2')
 
+        config_page_size = self.config.get('page_size')
+        if config_page_size and 1 <= int(config_page_size) <= 1000: # Zendesk's max page size
+            self.page_size = int(config_page_size)
+        else:
+            self.page_size = DEFAULT_PAGE_SIZE
+
     def get_bookmark(self, state):
         return utils.strptime_with_tz(singer.get_bookmark(state, self.name, self.replication_key))
 
@@ -89,11 +98,11 @@ class Stream():
 
     def load_schema(self):
         schema_file = "schemas/{}.json".format(self.name)
-        with open(get_abs_path(schema_file)) as f:
+        with open(get_abs_path(schema_file), encoding='UTF-8') as f:
             schema = json.load(f)
         return self._add_custom_fields(schema)
 
-    def _add_custom_fields(self, schema): # pylint: disable=no-self-use
+    def _add_custom_fields(self, schema):
         return schema
 
     def load_metadata(self):
@@ -136,20 +145,20 @@ class CursorBasedStream(Stream):
         '''
         url = self.endpoint.format(self.config['subdomain'])
         # Pass `request_timeout` parameter
-        for page in http.get_cursor_based(url, self.config['access_token'], self.request_timeout, **kwargs):
+        for page in http.get_cursor_based(url, self.config['access_token'], self.request_timeout, self.page_size, **kwargs):
             yield from page[self.item_key]
 
 class CursorBasedExportStream(Stream):
     endpoint = None
     item_key = None
 
-    def get_objects(self, start_time):
+    def get_objects(self, start_time, side_load=None):
         '''
         Retrieve objects from the incremental exports endpoint using cursor based pagination
         '''
         url = self.endpoint.format(self.config['subdomain'])
         # Pass `request_timeout` parameter
-        for page in http.get_incremental_export(url, self.config['access_token'], self.request_timeout, start_time):
+        for page in http.get_incremental_export(url, self.config['access_token'], self.request_timeout, start_time, side_load):
             yield from page[self.item_key]
 
 
@@ -158,7 +167,7 @@ def raise_or_log_zenpy_apiexception(schema, stream, e):
     # access to `custom_fields` and some do not. This is the specific
     # error that appears to be return from the API call in the event that
     # it doesn't have access.
-    if not isinstance(e, zenpy.lib.exception.APIException):
+    if not isinstance(e, APIException):
         raise ValueError("Called with a bad exception type") from e
 
     #If read permission is not available in OAuth access_token, then it returns the below error.
@@ -191,7 +200,7 @@ class Organizations(Stream):
         try:
             field_gen = self.client.organizations._query_zendesk(endpoint.organization_fields, # pylint: disable=protected-access
                                                                  'organization_field')
-        except zenpy.lib.exception.APIException as e:
+        except APIException as e:
             return raise_or_log_zenpy_apiexception(schema, self.name, e)
         schema['properties']['organization_fields']['properties'] = {}
         for field in field_gen:
@@ -225,7 +234,7 @@ class Users(CursorBasedExportStream):
     def _add_custom_fields(self, schema):
         try:
             field_gen = self.client.user_fields()
-        except zenpy.lib.exception.APIException as e:
+        except APIException as e:
             return raise_or_log_zenpy_apiexception(schema, self.name, e)
         schema['properties']['user_fields']['properties'] = {}
         for field in field_gen:
@@ -265,7 +274,9 @@ class Tickets(CursorBasedExportStream):
 
         bookmark = self.get_bookmark(state)
 
-        tickets = self.get_objects(bookmark)
+        # Fetch tickets with side loaded metrics
+        # https://developer.zendesk.com/documentation/ticketing/using-the-zendesk-api/side_loading/#supported-endpoints
+        tickets = self.get_objects(bookmark, side_load='metric_sets')
 
         audits_stream = TicketAudits(self.client, self.config)
         metrics_stream = TicketMetrics(self.client, self.config)
@@ -282,6 +293,9 @@ class Tickets(CursorBasedExportStream):
         if audits_stream.is_selected():
             LOGGER.info("Syncing ticket_audits per ticket...")
 
+        ticket_ids = []
+        counter = 0
+        start_time = time.time()
         for ticket in tickets:
             zendesk_metrics.capture('ticket')
 
@@ -293,43 +307,64 @@ class Tickets(CursorBasedExportStream):
             # yielding stream name with record in a tuple as it is used for obtaining only the parent records while sync
             yield (self.stream, ticket)
 
-            if audits_stream.is_selected():
-                try:
-                    for audit in audits_stream.sync(ticket["id"]):
+            # Skip deleted tickets because they don't have audits or comments
+            if ticket.get('status') == 'deleted':
+                continue
+
+            if metrics_stream.is_selected() and ticket.get('metric_set'):
+                zendesk_metrics.capture('ticket_metric')
+                metrics_stream.count+=1
+                yield (metrics_stream.stream, ticket["metric_set"])
+
+            # Check if the number of ticket IDs has reached the batch size.
+            ticket_ids.append(ticket["id"])
+            if len(ticket_ids) >= CONCURRENCY_LIMIT:
+                # Process audits and comments in batches
+                records = self.sync_ticket_audits_and_comments(
+                    comments_stream, audits_stream, ticket_ids)
+                for audits, comments in records:
+                    for audit in audits:
                         yield audit
-                except http.ZendeskNotFoundError:
-                    # Skip stream if ticket_audit does not found for particular ticekt_id. Earlier it throwing HTTPError
-                    # but now as error handling updated, it throws ZendeskNotFoundError.
-                    message = "Unable to retrieve audits for ticket (ID: {}), record not found".format(ticket['id'])
-                    LOGGER.warning(message)
-
-            if metrics_stream.is_selected():
-                try:
-                    for metric in metrics_stream.sync(ticket["id"]):
-                        yield metric
-                except http.ZendeskNotFoundError:
-                    # Skip stream if ticket_metric does not found for particular ticekt_id. Earlier it throwing HTTPError
-                    # but now as error handling updated, it throws ZendeskNotFoundError.
-                    message = "Unable to retrieve metrics for ticket (ID: {}), record not found".format(ticket['id'])
-                    LOGGER.warning(message)
-
-            if comments_stream.is_selected():
-                try:
-                    # add ticket_id to ticket_comment so the comment can
-                    # be linked back to it's corresponding ticket
-                    for comment in comments_stream.sync(ticket["id"]):
+                    for comment in comments:
                         yield comment
-                except http.ZendeskNotFoundError:
-                    # Skip stream if ticket_comment does not found for particular ticekt_id. Earlier it throwing HTTPError
-                    # but now as error handling updated, it throws ZendeskNotFoundError.
-                    message = "Unable to retrieve comments for ticket (ID: {}), record not found".format(ticket['id'])
-                    LOGGER.warning(message)
+                # Reset the list of ticket IDs after processing the batch.
+                ticket_ids = []
+                # Write state after processing the batch.
+                singer.write_state(state)
+                counter += CONCURRENCY_LIMIT
 
-            singer.write_state(state)
+                # Check if the number of records processed in a minute has reached the limit.
+                if counter >= AUDITS_REQUEST_PER_MINUTE:
+                    # Calculate elapsed time
+                    elapsed_time = time.time() - start_time
+
+                    # Calculate remaining time until the next minute, plus buffer of 2 more seconds
+                    remaining_time = max(0, 60 - elapsed_time + 2)
+
+                    # Sleep for the calculated time
+                    time.sleep(remaining_time)
+                    start_time = time.time()
+                    counter = 0
+
+        # Check if there are any remaining ticket IDs after the loop.
+        if ticket_ids:
+            records = self.sync_ticket_audits_and_comments(comments_stream, audits_stream, ticket_ids)
+            for audits, comments in records:
+                for audit in audits:
+                    yield audit
+                for comment in comments:
+                    yield comment
+
         emit_sub_stream_metrics(audits_stream)
         emit_sub_stream_metrics(metrics_stream)
         emit_sub_stream_metrics(comments_stream)
         singer.write_state(state)
+
+    def sync_ticket_audits_and_comments(self, comments_stream, audits_stream, ticket_ids):
+        if comments_stream.is_selected() or audits_stream.is_selected():
+            return asyncio.run(audits_stream.sync_in_bulk(ticket_ids, comments_stream))
+        # Return empty list of audits and comments if not selected
+        return [([], [])]
 
     def check_access(self):
         '''
@@ -350,19 +385,59 @@ class TicketAudits(Stream):
     endpoint='https://{}.zendesk.com/api/v2/tickets/{}/audits.json'
     item_key='audits'
 
-    def get_objects(self, ticket_id):
-        url = self.endpoint.format(self.config['subdomain'], ticket_id)
-        # Pass `request_timeout` parameter
-        pages = http.get_offset_based(url, self.config['access_token'], self.request_timeout)
-        for page in pages:
-            yield from page[self.item_key]
+    async def sync_in_bulk(self, ticket_ids, comments_stream):
+        """
+        Asynchronously fetch ticket audits for multiple tickets
+        """
+        # Create an asynchronous HTTP session
+        async with ClientSession() as session:
+            tasks = [self.sync(session, ticket_id, comments_stream)
+                     for ticket_id in ticket_ids]
+            # Run all tasks concurrently and wait for them to complete
+            return await asyncio.gather(*tasks)
 
-    def sync(self, ticket_id):
-        ticket_audits = self.get_objects(ticket_id)
-        for ticket_audit in ticket_audits:
-            zendesk_metrics.capture('ticket_audit')
-            self.count += 1
-            yield (self.stream, ticket_audit)
+    async def get_objects(self, session, ticket_id):
+        url = self.endpoint.format(self.config['subdomain'], ticket_id)
+        # Fetch the ticket audits using pagination
+        records = await http.paginate_ticket_audits(session, url, self.config['access_token'], self.request_timeout, self.page_size)
+
+        return records[self.item_key]
+
+    async def sync(self, session, ticket_id, comments_stream):
+        """
+        Fetch ticket audits for a single ticket. Also exctract comments for each audit.
+        """
+        audit_records, comment_records = [], []
+        try:
+            # Fetch ticket audits for the given ticket ID
+            ticket_audits = await self.get_objects(session, ticket_id)
+            for ticket_audit in ticket_audits:
+                if self.is_selected():
+                    zendesk_metrics.capture('ticket_audit')
+                    self.count += 1
+                    audit_records.append((self.stream, ticket_audit))
+
+                if comments_stream.is_selected():
+                    # Extract comments from ticket audit
+                    ticket_comments = (
+                        event for event in ticket_audit['events'] if event['type'] == 'Comment')
+                    zendesk_metrics.capture('ticket_comments')
+                    for ticket_comment in ticket_comments:
+                        # Update the comment with additional information
+                        ticket_comment.update({
+                            'created_at': ticket_audit['created_at'],
+                            'via': ticket_audit['via'],
+                            'metadata': ticket_audit['metadata'],
+                            'ticket_id': ticket_id
+                        })
+
+                        comments_stream.count += 1
+                        comment_records.append(
+                            (comments_stream.stream, ticket_comment))
+        except http.ZendeskNotFoundError:
+            return audit_records, comment_records
+
+        return audit_records, comment_records
 
     def check_access(self):
         '''
@@ -381,30 +456,13 @@ class TicketMetrics(CursorBasedStream):
     name = "ticket_metrics"
     replication_method = "INCREMENTAL"
     count = 0
-    endpoint = 'https://{}.zendesk.com/api/v2/tickets/{}/metrics'
-    item_key = 'ticket_metric'
-
-    def sync(self, ticket_id):
-        # Only 1 ticket metric per ticket
-        url = self.endpoint.format(self.config['subdomain'], ticket_id)
-        # Pass `request_timeout`
-        pages = http.get_offset_based(url, self.config['access_token'], self.request_timeout)
-        for page in pages:
-            zendesk_metrics.capture('ticket_metric')
-            self.count += 1
-            yield (self.stream, page[self.item_key])
 
     def check_access(self):
         '''
         Check whether the permission was given to access stream resources or not.
         '''
-        url = self.endpoint.format(self.config['subdomain'], '1')
-        HEADERS['Authorization'] = 'Bearer {}'.format(self.config["access_token"])
-        try:
-            http.call_api(url, self.request_timeout, params={'per_page': 1}, headers=HEADERS)
-        except http.ZendeskNotFoundError:
-            #Skip 404 ZendeskNotFoundError error as goal is just to check whether TicketComments have read permission or not
-            pass
+        # We load metrics as side load of tickets, so we don't need to check access
+        return
 
 class TicketMetricEvents(Stream):
     name = "ticket_metric_events"
@@ -438,35 +496,13 @@ class TicketComments(Stream):
     name = "ticket_comments"
     replication_method = "INCREMENTAL"
     count = 0
-    endpoint = "https://{}.zendesk.com/api/v2/tickets/{}/comments.json"
-    item_key='comments'
-
-    def get_objects(self, ticket_id):
-        url = self.endpoint.format(self.config['subdomain'], ticket_id)
-        # Pass `request_timeout` parameter
-        pages = http.get_offset_based(url, self.config['access_token'], self.request_timeout)
-
-        for page in pages:
-            yield from page[self.item_key]
-
-    def sync(self, ticket_id):
-        for ticket_comment in self.get_objects(ticket_id):
-            self.count += 1
-            zendesk_metrics.capture('ticket_comment')
-            ticket_comment['ticket_id'] = ticket_id
-            yield (self.stream, ticket_comment)
 
     def check_access(self):
         '''
         Check whether the permission was given to access stream resources or not.
         '''
-        url = self.endpoint.format(self.config['subdomain'], '1')
-        HEADERS['Authorization'] = 'Bearer {}'.format(self.config["access_token"])
-        try:
-            http.call_api(url, self.request_timeout, params={'per_page': 1}, headers=HEADERS)
-        except http.ZendeskNotFoundError:
-            #Skip 404 ZendeskNotFoundError error as goal is to just check to whether TicketComments have read permission or not
-            pass
+        # We load comments as side load of ticket_audits, so we don't need to check access
+        return
 
 class TalkPhoneNumbers(Stream):
     name = 'talk_phone_numbers'
