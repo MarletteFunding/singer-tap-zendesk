@@ -281,6 +281,7 @@ class Tickets(CursorBasedExportStream):
         audits_stream = TicketAudits(self.client, self.config)
         metrics_stream = TicketMetrics(self.client, self.config)
         comments_stream = TicketComments(self.client, self.config)
+        conversation_logs_stream = TicketConversationLogs(self.client, self.config)
 
         def emit_sub_stream_metrics(sub_stream):
             if sub_stream.is_selected():
@@ -327,6 +328,14 @@ class Tickets(CursorBasedExportStream):
                         yield audit
                     for comment in comments:
                         yield comment
+                
+                # Process conversation logs in batches
+                if conversation_logs_stream.is_selected():
+                    conversation_records = conversation_logs_stream.sync_in_bulk(ticket_ids)
+                    for conversation_log_batch in conversation_records:
+                        for conversation_log in conversation_log_batch:
+                            yield conversation_log
+                
                 # Reset the list of ticket IDs after processing the batch.
                 ticket_ids = []
                 # Write state after processing the batch.
@@ -354,10 +363,18 @@ class Tickets(CursorBasedExportStream):
                     yield audit
                 for comment in comments:
                     yield comment
+            
+            # Process remaining conversation logs
+            if conversation_logs_stream.is_selected():
+                conversation_records = conversation_logs_stream.sync_in_bulk(ticket_ids)
+                for conversation_log_batch in conversation_records:
+                    for conversation_log in conversation_log_batch:
+                        yield conversation_log
 
         emit_sub_stream_metrics(audits_stream)
         emit_sub_stream_metrics(metrics_stream)
         emit_sub_stream_metrics(comments_stream)
+        emit_sub_stream_metrics(conversation_logs_stream)
         singer.write_state(state)
 
     def sync_ticket_audits_and_comments(self, comments_stream, audits_stream, ticket_ids):
@@ -699,6 +716,83 @@ class CustomRoles(Stream):
                 self.update_bookmark(state, custom_role['updated_at'])
                 yield (self.stream, custom_role)
 
+class TicketConversationLogs(Stream):
+    name = "ticket_conversation_logs"
+    replication_method = "INCREMENTAL"
+    replication_key = "created_at"
+    count = 0
+    endpoint = 'https://{}.zendesk.com/api/v2/tickets/{}/conversation_log/'
+    item_key = 'events'
+
+    def sync_in_bulk(self, ticket_ids):
+        """
+        Fetch conversation logs for multiple tickets
+        """
+        results = []
+        for ticket_id in ticket_ids:
+            conversation_records = self.sync(ticket_id)
+            results.append(conversation_records)
+        return results
+
+    def get_objects(self, ticket_id):
+        """
+        Get conversation log events for a ticket using cursor-based pagination
+        """
+        url = self.endpoint.format(self.config['subdomain'], ticket_id)
+        # Fetch the conversation_log events using cursor-based pagination
+        pages = http.get_cursor_based(url, self.config['access_token'], self.request_timeout, self.page_size)
+        
+        events = []
+        for page in pages:
+            events.extend(page[self.item_key])
+        
+        return events
+
+
+    def sync(self, ticket_id):
+        """
+        Fetch conversation logs for a single ticket
+        """
+        conversation_records = []
+        try:
+            # Fetch conversation logs for the given ticket ID
+            conversation_events = self.get_objects(ticket_id)
+            for event in conversation_events:
+                if self.is_selected():
+                    zendesk_metrics.capture('ticket_conversation_log')
+                    self.count += 1
+                    conversation_records.append((self.stream, event))
+        except http.ZendeskNotFoundError:
+            return conversation_records
+
+        return conversation_records
+
+    def sync_incremental(self, state):
+        """
+        Note: This endpoint is per-ticket, so incremental sync is handled 
+        by the main tickets stream calling sync_in_bulk with ticket IDs.
+        This method is kept for interface compatibility but not used directly.
+        """
+        # This stream is synced per-ticket via the tickets stream
+        # No direct incremental sync is available for this endpoint
+        LOGGER.info("TicketConversationLogs are synced per-ticket via the tickets stream")
+        return
+        yield  # Make this a generator for compatibility
+
+    def check_access(self):
+        '''
+        Check whether the permission was given to access stream resources or not.
+        '''
+        # Use test ticket ID "1" to check access to conversation logs endpoint
+        url = self.endpoint.format(self.config['subdomain'], '1')
+        HEADERS['Authorization'] = f'Bearer {self.config["access_token"]}'
+        try:
+            http.call_api(url, self.request_timeout, params={}, headers=HEADERS)
+        except http.ZendeskNotFoundError:
+            # Skip 404 ZendeskNotFoundError error as goal is just to check whether TicketConversationLogs have read permission or not
+            pass
+
+
 
 STREAMS = {
     "tickets": Tickets,
@@ -718,5 +812,6 @@ STREAMS = {
     "sla_policies": SLAPolicies,
     "talk_phone_numbers": TalkPhoneNumbers,
     "custom_roles": CustomRoles,
+    "ticket_conversation_logs": TicketConversationLogs,
 }
 
