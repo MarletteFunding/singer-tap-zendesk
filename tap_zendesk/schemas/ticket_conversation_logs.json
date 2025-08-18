@@ -5,6 +5,10 @@
       "type": "string",
       "description": "The event ID"
     },
+    "ticket_id": {
+      "type": "integer",
+      "description": "The ticket ID this conversation log event belongs to"
+    },
     "reference": {
       "type": "string",
       "description": "Internal reference identifier for the conversation message"

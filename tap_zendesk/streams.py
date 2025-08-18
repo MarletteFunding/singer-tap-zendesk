@@ -744,7 +744,10 @@ class TicketConversationLogs(Stream):
         
         events = []
         for page in pages:
-            events.extend(page[self.item_key])
+            for event in page[self.item_key]:
+                # Add ticket_id as a top-level property to each event
+                event['ticket_id'] = ticket_id
+                events.append(event)
         
         return events
 
