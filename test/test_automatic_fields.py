@@ -1,9 +1,9 @@
-import tap_tester.connections as connections
-import tap_tester.runner as runner
 from base import ZendeskTest
+from tap_tester import connections, runner
 
 # BUG https://jira.talendforge.org/browse/TDL-19428
 #     [tap-zendesk] Consistently replicating duplicate `organizations` record
+
 
 class ZendeskAutomaticFields(ZendeskTest):
     """

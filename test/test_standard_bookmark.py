@@ -1,17 +1,15 @@
-import tap_tester.connections as connections
-import tap_tester.runner as runner
-from base import ZendeskTest
-from tap_tester import menagerie
 from datetime import datetime
-import uuid
-import os
-import time
+
+from base import ZendeskTest
+from tap_tester import connections, menagerie, runner, LOGGER
+
 
 class ZendeskBookMark(ZendeskTest):
     """Test tap sets a bookmark and respects it for the next sync of a stream"""
 
     def name(self):
         return "zendesk_bookmark_test"
+
 
     def test_run(self):
         """
