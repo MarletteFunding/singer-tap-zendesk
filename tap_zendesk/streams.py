@@ -701,7 +701,7 @@ class CustomRoles(Stream):
     def get_objects(self):
         url = self.endpoint.format(self.config['subdomain'])
         # Pass `request_timeout` parameter
-        pages = http.get_offset_based(url, self.config['access_token'], self.request_timeout)
+        pages = http.get_offset_based(url, self.config['access_token'], self.request_timeout, self.page_size)
 
         for page in pages:
             yield from page[self.item_key]
