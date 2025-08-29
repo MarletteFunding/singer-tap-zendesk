@@ -14,7 +14,7 @@ setup(name='tap-zendesk',
           'zenpy==2.0.24',
           'backoff==2.2.1',
           'requests==2.32.4',
-          'aiohttp==3.11.11'
+          'aiohttp==3.12.14'
       ],
       extras_require={
           'dev': [
